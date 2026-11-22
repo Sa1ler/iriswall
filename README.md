@@ -41,7 +41,7 @@
 ```bash
 sudo pacman -S --needed rust base-devel pkgconf wayland mesa libglvnd git
 
-git clone https://github.com/ТВОЁ_ИМЯ/iriswall.git
+git clone https://github.com/Sa1ler/iriswall.git
 cd iriswall
 cargo build --release
 install -Dm755 target/release/iriswall ~/.local/bin/iriswall
