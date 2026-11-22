@@ -1,8 +1,11 @@
 [package]
 name = "iriswall"
 version = "0.1.0"
-edition = "2021"
+edition = "2026"
 description = "Лёгкий демон обоев для Hyprland: layer-shell + EGL/GLES3, переход «круг из центра»"
+license = "MIT"
+repository = "https://github.com/Sa1ler/iriswall"
+
 
 [dependencies]
 wayland-client = "0.31"
