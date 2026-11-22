@@ -5,7 +5,7 @@ pub const DEFAULT_CONFIG: &str = r##"# iriswall — конфиг
 # После правки: iriswall reload
 
 # Папка с обоями (jpg, png, webp, bmp, gif; без вложенных папок)
-dir = "~/Pictures/Wallpapers"
+dir = "~/.config/hypr/walls"
 
 # Текущие обои. Демон сам обновляет эту строку при каждой смене.
 # Можно поменять руками и выполнить `iriswall reload`.
