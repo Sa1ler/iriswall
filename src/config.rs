@@ -5,7 +5,7 @@ pub const DEFAULT_CONFIG: &str = r##"# iriswall — конфиг
 # После правки: iriswall reload
 
 # Папка с обоями (jpg, png, webp, bmp, gif; без вложенных папок)
-dir = "~/.config/hypr/walls"
+dir = "~/Pictures/Wallpapers"
 
 # Текущие обои. Демон сам обновляет эту строку при каждой смене.
 # Можно поменять руками и выполнить `iriswall reload`.
@@ -145,6 +145,18 @@ pub fn save_current(path: &Path, cur: &Path) {
     if let Err(e) = std::fs::write(path, doc.to_string()) {
         eprintln!("iriswall: не удалось записать конфиг: {e}");
     }
+}
+
+/// Записывает строковое значение в конфиг, сохраняя комментарии и остальные ключи.
+pub fn save_str(path: &Path, key: &str, val: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    doc[key] = toml_edit::value(val);
+    let _ = std::fs::write(path, doc.to_string());
 }
 
 fn is_image(p: &Path) -> bool {

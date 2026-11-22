@@ -651,6 +651,7 @@ impl App {
             "effect" => {
                 if arg == "random" || config::effect_id(arg).is_some() {
                     self.cfg.effect = arg.to_string();
+                    config::save_str(&self.cfg_path, "effect", arg);
                     "ok".into()
                 } else {
                     format!(
