@@ -42,6 +42,16 @@ random = false
 
 # Цвет фона (поля в режиме fit и пока нет картинки)
 background = "#000000"
+
+# Команда, которая запускается после каждой смены обоев (через `sh -c`, не блокирует демон).
+# Получает переменные: IRISWALL_PATH, IRISWALL_PRIMARY, IRISWALL_BACKGROUND,
+# IRISWALL_FOREGROUND, IRISWALL_DARK (1/0), IRISWALL_COLORS, IRISWALL_PALETTE.
+# Пример: hook = "~/.config/scripts/theme-from-wallpaper.sh"
+hook = ""
+
+# Освобождать память в простое: возвращать кучу системе и вытеснять анонимные
+# страницы в swap/zram (если он есть). Через ~3 с после смены обоев
+trim_idle = true
 "##;
 
 pub const EFFECTS: [&str; 6] = ["iris", "sweep", "ripple", "mosaic", "zoom", "ink"];
@@ -65,6 +75,8 @@ pub struct Config {
     pub interval: u64,
     pub random: bool,
     pub background: String,
+    pub hook: String,
+    pub trim_idle: bool,
 }
 
 impl Default for Config {
@@ -82,6 +94,8 @@ impl Default for Config {
             interval: 0,
             random: false,
             background: "#000000".into(),
+            hook: String::new(),
+            trim_idle: true,
         }
     }
 }

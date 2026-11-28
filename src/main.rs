@@ -1,4 +1,6 @@
 mod config;
+mod mem;
+mod palette;
 mod render;
 
 use calloop::generic::Generic;
@@ -7,12 +9,13 @@ use calloop::{EventLoop, Interest, LoopHandle, LoopSignal, Mode, PostAction};
 use calloop_wayland_source::WaylandSource;
 use config::Config;
 use khronos_egl as egl;
+use palette::Palette;
 use render::{DrawParams, Image, Renderer, Tex};
 use std::error::Error;
 use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -107,6 +110,11 @@ struct App {
     rot_gen: u64,
     rng: u64,
     last_effect: i32,
+
+    history: Vec<PathBuf>,
+    back_target: Option<PathBuf>,
+    cur_palette: Option<Palette>,
+    trim_gen: u64,
 }
 
 impl App {
@@ -390,12 +398,73 @@ impl App {
             return false;
         }
         let img = self.pending.take().unwrap();
-        let tex = self.renderer.as_ref().unwrap().upload(&img);
-        self.cfg.current = img.path.to_string_lossy().to_string();
-        config::save_current(&self.cfg_path, &img.path);
-        self.cur_path = Some(img.path);
+
+        // mip-уровни только если картинка где-то показывается с заметным уменьшением
+        let fit = self.cfg.mode == "fit";
+        let mips = self.outputs.iter().filter(|o| o.configured).any(|o| {
+            let (pw, ph) = o.px();
+            let a = pw as f32 / img.w as f32;
+            let b = ph as f32 / img.h as f32;
+            (if fit { a.min(b) } else { a.max(b) }) < 0.75
+        });
+        let tex = self.renderer.as_ref().unwrap().upload(&img, mips);
+
+        // пиксели на CPU больше не нужны: освобождаем сразу
+        let Image {
+            path,
+            palette,
+            rgb,
+            ..
+        } = img;
+        drop(rgb);
+
+        // история для `iriswall back`; возврат назад сам историю не пополняет
+        let is_back = self.back_target.as_ref() == Some(&path);
+        if is_back {
+            self.back_target = None;
+        }
+        let prev = self.cur_path.replace(path.clone());
+        if !is_back {
+            if let Some(p) = prev {
+                if p != path {
+                    self.history.push(p);
+                    if self.history.len() > 50 {
+                        self.history.remove(0);
+                    }
+                }
+            }
+        }
+
+        self.cfg.current = path.to_string_lossy().to_string();
+        config::save_current(&self.cfg_path, &path);
+        self.after_change(&path, palette);
         self.start_transition(tex);
+        self.schedule_trim();
         true
+    }
+
+    /// Палитра в файл и пользовательский hook
+    fn after_change(&mut self, path: &Path, palette: Palette) {
+        palette::save(&palette, path);
+        if !self.cfg.hook.trim().is_empty() {
+            palette::run_hook(&self.cfg.hook, path, &palette);
+        }
+        self.cur_palette = Some(palette);
+    }
+
+    /// Через несколько секунд после конца перехода возвращаем память системе
+    fn schedule_trim(&mut self) {
+        self.trim_gen += 1;
+        let g = self.trim_gen;
+        let delay = Duration::from_millis(self.cfg.transition_ms + 3000);
+        let _ = self
+            .handle
+            .insert_source(Timer::from_duration(delay), move |_, _, app: &mut App| {
+                if app.trim_gen == g && app.transition.is_none() && app.inflight.is_none() {
+                    mem::trim(app.cfg.trim_idle);
+                }
+                TimeoutAction::Drop
+            });
     }
 
     fn start_transition(&mut self, tex: Tex) {
@@ -660,16 +729,33 @@ impl App {
                     )
                 }
             }
+            "back" => {
+                while let Some(p) = self.history.pop() {
+                    if p.is_file() {
+                        self.back_target = Some(p.clone());
+                        self.request(p);
+                        return "ok".into();
+                    }
+                }
+                "история пуста".into()
+            }
+            "current" => self.cfg.current.clone(),
+            "palette" => match &self.cur_palette {
+                Some(p) => p.to_json(&self.cfg.current).trim_end().to_string(),
+                None => "палитры ещё нет".into(),
+            },
             "reload" => self.reload(),
             "status" => format!(
-                "current={}\ndir={}\nfiles={}\noutputs={}\ninterval={}s\nrandom={}\neffect={}",
+                "current={}\ndir={}\nfiles={}\noutputs={}\ninterval={}s\nrandom={}\neffect={}\nhistory={}\n{}",
                 self.cfg.current,
                 self.cfg.dir,
                 self.files.len(),
                 self.outputs.len(),
                 self.cfg.interval,
                 self.cfg.random,
-                self.cfg.effect
+                self.cfg.effect,
+                self.history.len(),
+                mem::report()
             ),
             "quit" => {
                 self.signal.stop();
@@ -845,7 +931,8 @@ fn run_daemon() -> Result<(), Box<dyn Error>> {
         eprintln!("iriswall: нет viewporter/fractional-scale — дробный масштаб не поддерживается");
     }
 
-    // EGL + GLES3
+    // EGL + GLES3 (перед инициализацией драйвера просим Mesa не тратить память зря)
+    let mesa_keys = mem::mesa_env();
     let egl = egl::Instance::new(egl::Static);
     let egl_display = unsafe { egl.get_display(conn.backend().display_ptr() as *mut c_void) }
         .ok_or("eglGetDisplay вернул пусто")?;
@@ -873,6 +960,8 @@ fn run_daemon() -> Result<(), Box<dyn Error>> {
         None,
         &[egl::CONTEXT_CLIENT_VERSION, 3, egl::NONE],
     )?;
+    // драйвер уже прочитал настройки; не передаём их процессам из hook
+    mem::unset_env(&mesa_keys);
 
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -912,6 +1001,10 @@ fn run_daemon() -> Result<(), Box<dyn Error>> {
         rot_gen: 0,
         rng: seed,
         last_effect: -1,
+        history: Vec::new(),
+        back_target: None,
+        cur_palette: None,
+        trim_gen: 0,
     };
 
     // уже существующие мониторы
@@ -981,8 +1074,11 @@ fn usage() {
         "iriswall — демон обоев для Hyprland\n\n\
          iriswall [daemon]      запустить демон\n\
          iriswall next | prev   следующие / предыдущие обои из папки\n\
+         iriswall back          вернуться к обоям, что были до этого (история)\n\
          iriswall random        случайные обои\n\
          iriswall set <файл>    поставить конкретную картинку\n\
+         iriswall current       путь к текущим обоям\n\
+         iriswall palette       палитра текущих обоев (JSON)\n\
          iriswall reload        перечитать конфиг и папку\n\
          iriswall effect <имя>  эффект: random, iris, sweep, ripple, mosaic, zoom, ink\n\
          iriswall status        показать состояние\n\
@@ -991,6 +1087,7 @@ fn usage() {
 }
 
 fn main() {
+    mem::tune();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         None | Some("daemon") => match run_daemon() {
@@ -1024,7 +1121,10 @@ fn main() {
                 1
             }
         },
-        Some(cmd @ ("next" | "prev" | "random" | "reload" | "status" | "quit")) => client(cmd),
+        Some(
+            cmd @ ("next" | "prev" | "back" | "random" | "current" | "palette" | "reload"
+            | "status" | "quit"),
+        ) => client(cmd),
         Some(other) => {
             eprintln!("неизвестная команда: {other}\n");
             usage();

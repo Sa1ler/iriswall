@@ -1,3 +1,4 @@
+use crate::palette::{self, Palette};
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 
@@ -7,27 +8,45 @@ pub struct Image {
     pub path: PathBuf,
     pub w: u32,
     pub h: u32,
-    pub rgba: Vec<u8>,
+    /// RGB8 без альфы: шейдер использует только .rgb, лишний канал стоил бы +33% памяти
+    pub rgb: Vec<u8>,
+    pub palette: Palette,
 }
 
-/// Декодирует картинку и заранее уменьшает её до размера, которого хватает
-/// для заполнения самого большого монитора (не держим 8K-текстуру ради 1080p).
+/// Декодирует картинку (с учётом EXIF-ориентации) и заранее уменьшает её до размера,
+/// которого хватает для заполнения самого большого монитора. Всё делается в RGB8,
+/// без промежуточной RGBA-копии: пик памяти при декодировании 4K/8K заметно ниже.
 pub fn decode(path: &Path, max_w: u32, max_h: u32) -> Result<Image, String> {
-    let img = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut rgba = img.into_rgba8();
-    let (iw, ih) = rgba.dimensions();
+    use image::{DynamicImage, ImageDecoder, ImageReader};
+
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let reader = ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| fail(&e))?;
+    let mut dec = reader.into_decoder().map_err(|e| fail(&e))?;
+    let orient = dec
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(dec).map_err(|e| fail(&e))?;
+    img.apply_orientation(orient);
+
+    let mut rgb = img.into_rgb8();
+    let (iw, ih) = rgb.dimensions();
     let s = (max_w as f32 / iw as f32).max(max_h as f32 / ih as f32);
     if s < 1.0 {
         let nw = ((iw as f32 * s).ceil() as u32).max(1);
         let nh = ((ih as f32 * s).ceil() as u32).max(1);
-        rgba = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Lanczos3);
+        // исходник освобождается сразу после присваивания
+        rgb = image::imageops::resize(&rgb, nw, nh, image::imageops::FilterType::Lanczos3);
     }
-    let (w, h) = rgba.dimensions();
+    let (w, h) = rgb.dimensions();
+    let palette = palette::extract(rgb.as_raw(), w, h);
     Ok(Image {
         path: path.to_path_buf(),
         w,
         h,
-        rgba: rgba.into_raw(),
+        rgb: rgb.into_raw(),
+        palette,
     })
 }
 
@@ -364,7 +383,9 @@ impl Renderer {
         }
     }
 
-    pub fn upload(&self, img: &Image) -> Tex {
+    /// `mips`: строить ли mip-уровни. Нужны только если картинка показывается с
+    /// заметным уменьшением (монитор заметно меньше текстуры); иначе это +33% памяти впустую.
+    pub fn upload(&self, img: &Image, mips: bool) -> Tex {
         unsafe {
             let mut id = 0u32;
             gl::GenTextures(1, &mut id);
@@ -373,19 +394,22 @@ impl Renderer {
             gl::TexImage2D(
                 gl::TEXTURE_2D,
                 0,
-                gl::RGBA8 as i32,
+                gl::RGB8 as i32,
                 img.w as i32,
                 img.h as i32,
                 0,
-                gl::RGBA,
+                gl::RGB,
                 gl::UNSIGNED_BYTE,
-                img.rgba.as_ptr() as *const _,
+                img.rgb.as_ptr() as *const _,
             );
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR_MIPMAP_LINEAR as i32);
+            let min = if mips { gl::LINEAR_MIPMAP_LINEAR } else { gl::LINEAR };
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, min as i32);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
-            gl::GenerateMipmap(gl::TEXTURE_2D);
+            if mips {
+                gl::GenerateMipmap(gl::TEXTURE_2D);
+            }
             Tex {
                 id,
                 w: img.w,
